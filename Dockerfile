@@ -21,3 +21,12 @@ RUN source /app/env/bin/activate && \
     git clone https://github.com/AVSLab/basilisk.git --depth 1 --branch 2.1.6 --single-branch && \
     cd basilisk && \
     python conanfile.py --generator 'Unix Makefiles' --buildProject True
+RUN source /app/env/bin/activate && \
+    git clone https://github.com/connorfuhrman/paramz --depth 1 --branch connorfuhrman/np_type_alias_dep --single-branch && \
+    pip install ./paramz
+
+WORKDIR /app
+COPY requirements.txt .
+RUN source env/bin/activate && \
+    pip install --no-cache -r requirements.txt
+COPY attitude_pointing_rl.py app.py

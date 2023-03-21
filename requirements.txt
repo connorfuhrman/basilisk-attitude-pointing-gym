@@ -1,8 +1,15 @@
 ray[all]
 torch
+gymnasium
 tensorflow_probability
-tensorflow
-torch
 conan
 wheel
-basilisk
+numpy
+Basilisk
+GPy
+scikit-learn
+
+# MUST download and install paramz from
+# https://github.com/connorfuhrman/paramz/tree/connorfuhrman/np_type_alias_dep
+# as 0.9.5 uses a depreciated numpy alias and will crash population based tuning
+paramz==0.9.5a

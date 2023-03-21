@@ -26,6 +26,7 @@ import matplotlib.pyplot as plt
 import itertools as it
 import os
 import gymnasium as gym
+
 import ray
 from ray.rllib.env.env_context import EnvContext
 from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
@@ -33,25 +34,33 @@ from ray.rllib.models.torch.fcnet import FullyConnectedNetwork as TorchFC
 from ray.rllib.models import ModelCatalog
 from ray.rllib.utils.framework import try_import_torch, try_import_tf
 from ray.tune.registry import get_trainable_cls
-from ray import air, tune
-from ray.rllib.utils.test_utils import check_learning_achieved
+from ray.tune.schedulers.pb2 import PB2
+
 from argparse import ArgumentParser
+from multiprocessing import cpu_count
 
 parser = ArgumentParser()
-parser.add_argument("--num_rollout_workers",
+parser.add_argument("--num_pbt_experiments",
                     type=int,
-                    required=True,
-                    help="Number of rollout workers passed to Ray trainer config")
-parser.add_argument("--num_gpus",
-                    type=int,
-                    default=0,
-                    help="Number of GPUS passed to Ray trainer config")
+                    default=cpu_count(),
+                    help="Number of PBT experiments to run in parallel")
+# parser.add_argument("--num_gpus",
+#                     type=int,
+#                     default=0,
+#                     help="Number of GPUS passed to Ray trainer config")
 parser.add_argument("--stopper_patience",
                     type=int,
-                    default=10,
+                    default=15,
                     help="Patience value to pass to Ray PlateauStopper object")
+parser.add_argument("--logdir",
+                    required=True,
+                    type=str,
+                    help="Ray log dir")
 
 args = parser.parse_args()
+
+if (args.stopper_patience < 4):
+    raise RuntimeError("Stopper patience needs to be > 4!")
 
 # Start ray. The dashboard host is set to be the rostration server
 # accessable on the local SpaceTREx WiFi network in Drake
@@ -332,7 +341,7 @@ config = (
         'show_debug': False
     })
     .framework("torch")
-    .rollouts(num_rollout_workers=args.num_rollout_workers, batch_mode="complete_episodes")
+    .rollouts(num_rollout_workers=0)
     .training(
         # model={
         #     "custom_model": "my_model",
@@ -340,30 +349,67 @@ config = (
         # },
         # train_batch_size=8000,
     )
-    .resources(num_gpus=args.num_gpus)
+    .resources(num_gpus=0)
 )
 
-# import pprint
-# pp = pprint.PrettyPrinter(indent=4)
-# pp.pprint(config.to_dict())
+pb2 = PB2(
+    time_attr='training_iteration',
+    metric='episode_reward_mean',
+    mode='max',
+    perturbation_interval=int(args.stopper_patience/2),
+    quantile_fraction=0.25,  # magic number from example
+    hyperparam_bounds={
+        "lambda": [0.9, 1.0],
+        "clip_param": [0.1, 0.5],
+        "lr": [1e-3, 1e-5],
+        "train_batch_size": [1000, 60000],
+    },  # magic numbers from example
+)
 
-# Define stop conditions
-# stop_cond = {
-#     "episode_reward_mean" : -500,  # this is somewhat random but based on what the reward would have been in the regular controller
-#     "training_iteration": 5000
-# }
 stop_cond = ray.tune.stopper.ExperimentPlateauStopper(
     metric='episode_reward_mean',
     mode='max',
     patience=args.stopper_patience,  # number of epochs to wait for a change in the model
+    top=max(1, int(args.num_pbt_experiments/2)),
 )
+
+checkpoint_config = ray.air.CheckpointConfig(
+    checkpoint_score_attribute='episode_reward_mean',
+    checkpoint_score_order='max',
+    checkpoint_frequency=5,
+    checkpoint_at_end=True
+)
+
+param_space = config.to_dict()
+# Override the parameters we're tuning here
+param_space["lambda"] = ray.tune.uniform(0.9, 1.0)
+param_space["clip_param"] =  ray.tune.uniform(0.1, 0.5)
+param_space["lr"] = ray.tune.uniform(1e-3, 1e-5)
+param_space["train_batch_size"] = ray.tune.randint(1_000, 60_000)
+param_space["entropy_coeff"] = ray.tune.uniform(0, 0.003)
+param_space["gamma"] = ray.tune.uniform(0.8, 0.9997)
+param_space["vf_loss_coeff"] = ray.tune.uniform(0.5, 1.0)
+param_space["batch_mode"] = ray.tune.choice(["complete_episodes", "truncate_episodes"])
+param_space["train_batch_size"] = ray.tune.randint(1000, 60_000)
+# Override the number of workers to be 0 so we can run cpu_count
+# expriments in parallel
+param_space["num_workers"] = 0
 
 
 # Perform the training!
-tuner = tune.Tuner(
+tuner = ray.tune.Tuner(
     "PPO",
-    param_space=config.to_dict(),
-    run_config=air.RunConfig(stop=stop_cond)
+    param_space=param_space,
+    run_config=ray.air.RunConfig(
+        stop=stop_cond,
+        checkpoint_config=checkpoint_config,
+        local_dir=args.logdir
+    ),
+    tune_config=ray.tune.TuneConfig(
+        scheduler=pb2,
+        num_samples=args.num_pbt_experiments,
+        reuse_actors=False
+    )
 )
 
 results = tuner.fit()
